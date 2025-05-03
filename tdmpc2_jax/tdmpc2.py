@@ -28,6 +28,8 @@ class TDMPC2(struct.PyTreeNode):
   min_plan_std: float
   max_plan_std: float
   temperature: float
+  # new prior coefficient
+  prior_coef: float
 
   # Optimization
   batch_size: int = struct.field(pytree_node=False)
@@ -62,7 +64,9 @@ class TDMPC2(struct.PyTreeNode):
              value_coef: float,
              continue_coef: float,
              entropy_coef: float,
-             tau: float
+             tau: float,
+             # new prior coefficient
+             prior_coef: float = 0.5,
              ) -> TDMPC2:
 
     return cls(model=world_model,
@@ -84,6 +88,7 @@ class TDMPC2(struct.PyTreeNode):
                continue_coef=continue_coef,
                entropy_coef=entropy_coef,
                tau=tau,
+               prior_coef=prior_coef,
                scale=jnp.array([1.0]),
                )
 
@@ -229,6 +234,8 @@ class TDMPC2(struct.PyTreeNode):
              next_observations: jax.Array,
              terminated: jax.Array,
              truncated: jax.Array,
+             plan_mean: jax.Array,
+             plan_std: jax.Array,
              *,
              key: PRNGKeyArray
              ) -> Tuple[TDMPC2, Dict[str, Any]]:
@@ -352,10 +359,22 @@ class TDMPC2(struct.PyTreeNode):
       scale = percentile_normalization(Q[0], self.scale).clip(1, None)
       Q = Q / sg(scale)
 
+      # -- new code to compute tdm(pc)^2 policy loss --
+      planner_std = jnp.maximum(plan_std, self.min_plan_std * jnp.ones_like(plan_std))
+
+      # compute regularization using Gaussian log probability
+      eps = (actions - plan_mean) / planner_std
+      log_prior = -0.5 * jnp.sum(eps**2 + jnp.log(2 * jnp.pi) + jnp.log(planner_std**2), axis=-1)
+
       # Compute policy objective (equation 4)
       rho = self.rho ** jnp.arange(self.horizon+1)
-      policy_loss = ((self.entropy_coef * log_probs -
-                     Q).mean(axis=1) * rho).mean()
+      # policy_loss = ((self.entropy_coef * log_probs -
+      #                  Q).mean(axis=1) * rho).mean()
+      q_loss = ((self.entropy_coef * log_probs -Q).mean(axis=1) * rho).mean()
+      prior_loss = -(log_prior.mean(axis=1) * rho).mean()
+      policy_loss = q_loss + self.prior_coef * prior_loss
+      # -- end of new code --
+
       return policy_loss, {'policy_loss': policy_loss, 'policy_scale': scale}
     policy_grads, policy_info = jax.grad(policy_loss_fn, has_aux=True)(
         self.model.policy_model.params)
