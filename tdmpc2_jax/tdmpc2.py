@@ -349,11 +349,12 @@ class TDMPC2(struct.PyTreeNode):
     # Update policy
     def policy_loss_fn(params: Dict):
       action_key, Q_key = jax.random.split(policy_key, 2)
+      trim_zs = zs[:-1]
       actions, _, _, log_probs = self.model.sample_actions(
-          zs, params, key=action_key)
+          trim_zs, params, key=action_key)
 
       # Compute Q-values
-      Qs, _ = self.model.Q(zs, actions, new_value_model.params, key=Q_key)
+      Qs, _ = self.model.Q(trim_zs, actions, new_value_model.params, key=Q_key)
       Q = Qs.mean(axis=0)
       # Update and apply scale
       scale = percentile_normalization(Q[0], self.scale).clip(1, None)
@@ -367,7 +368,7 @@ class TDMPC2(struct.PyTreeNode):
       log_prior = -0.5 * jnp.sum(eps**2 + jnp.log(2 * jnp.pi) + jnp.log(planner_std**2), axis=-1)
 
       # Compute policy objective (equation 4)
-      rho = self.rho ** jnp.arange(self.horizon+1)
+      rho = self.rho ** jnp.arange(self.horizon) # +1)
       # policy_loss = ((self.entropy_coef * log_probs -
       #                  Q).mean(axis=1) * rho).mean()
       q_loss = ((self.entropy_coef * log_probs -Q).mean(axis=1) * rho).mean()
