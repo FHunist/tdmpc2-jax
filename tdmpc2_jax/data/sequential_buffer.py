@@ -30,6 +30,7 @@ class SequentialReplayBuffer():
     seed : Optional[int], optional
         Seed for sampling, by default None
     """
+    print("[BUFFER] Creating buffer with priority sampling")
     self.capacity = capacity
     self.num_envs = num_envs
     self.data = jax.tree.map(lambda x: np.zeros(
