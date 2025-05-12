@@ -32,6 +32,7 @@ class SequentialReplayBuffer():
     """
     self.capacity = capacity
     self.num_envs = num_envs
+    print("Buffer capacity: ", self.capacity)
     self.data = jax.tree.map(lambda x: np.zeros(
         (capacity,) + np.asarray(x).shape, np.asarray(x).dtype), dummy_input)
 

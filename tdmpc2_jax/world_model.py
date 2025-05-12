@@ -21,6 +21,7 @@ class WorldModel(struct.PyTreeNode):
   encoder: TrainState
   dynamics_model: TrainState
   reward_model: TrainState
+  state_estimator_model: TrainState # new state estimator model
   policy_model: TrainState
   value_model: TrainState
   target_value_model: TrainState
@@ -30,6 +31,7 @@ class WorldModel(struct.PyTreeNode):
   # Architecture
   mlp_dim: int = struct.field(pytree_node=False)
   latent_dim: int = struct.field(pytree_node=False)
+  state_dim: int = struct.field(pytree_node=False)
   num_value_nets: int = struct.field(pytree_node=False)
   num_bins: int = struct.field(pytree_node=False)
   symlog_min: float
@@ -46,6 +48,7 @@ class WorldModel(struct.PyTreeNode):
              # Architecture
              mlp_dim: int,
              latent_dim: int,
+             state_dim: int, # new state dimension
              value_dropout: float,
              num_value_nets: int,
              num_bins: int,
@@ -63,8 +66,8 @@ class WorldModel(struct.PyTreeNode):
              *,
              key: PRNGKeyArray,
              ):
-    dynamics_key, reward_key, value_key, policy_key, continue_key = jax.random.split(
-        key, 5)
+    dynamics_key, reward_key, state_estimator_key, value_key, policy_key, continue_key = jax.random.split(
+        key, 6)
 
     # Latent forward dynamics model
     dynamics_module = nn.Sequential([
@@ -98,6 +101,24 @@ class WorldModel(struct.PyTreeNode):
             optax.clip_by_global_norm(max_grad_norm),
             optax.adam(learning_rate),
         ))
+    
+    # State estimation model -- NEW --
+    state_estimator_module = nn.Sequential([
+        NormedLinear(mlp_dim, activation=mish, dtype=dtype),
+        NormedLinear(mlp_dim, activation=mish, dtype=dtype),
+        nn.Dense(state_dim, kernel_init=nn.initializers.zeros)
+    ])
+    state_estimator_model = TrainState.create(
+        apply_fn=state_estimator_module.apply,
+        params=state_estimator_module.init(
+            state_estimator_key, jnp.zeros(latent_dim + action_dim))['params'],
+        tx=optax.chain(
+            optax.zero_nans(),
+            optax.clip_by_global_norm(max_grad_norm),
+            optax.adam(learning_rate),
+        ))
+    
+    # -- END --
 
     # Policy model
     policy_module = nn.Sequential([
@@ -166,6 +187,11 @@ class WorldModel(struct.PyTreeNode):
       print("------------")
       print(reward_module.tabulate(jax.random.key(0), jnp.ones(
           latent_dim + action_dim), compute_flops=True))
+      
+      print("State Estimator Model")
+      print("------------")
+      print(state_estimator_model.tabulate(jax.random.key(0), jnp.ones(
+          latent_dim + action_dim), compute_flops=True))
 
       print("Policy Model")
       print("------------")
@@ -192,6 +218,7 @@ class WorldModel(struct.PyTreeNode):
         encoder=encoder,
         dynamics_model=dynamics_model,
         reward_model=reward_model,
+        state_estimator_model=state_estimator_model,  # new state estimator model
         policy_model=policy_model,
         value_model=value_model,
         target_value_model=target_value_model,
@@ -199,6 +226,7 @@ class WorldModel(struct.PyTreeNode):
         # Architecture
         mlp_dim=mlp_dim,
         latent_dim=latent_dim,
+        state_dim=state_dim,  # new state dimension
         num_value_nets=num_value_nets,
         num_bins=num_bins,
         symlog_min=float(symlog_min),
@@ -226,6 +254,12 @@ class WorldModel(struct.PyTreeNode):
     reward = two_hot_inv(logits, self.symlog_min,
                          self.symlog_max, self.num_bins)
     return reward, logits
+  
+  @jax.jit
+  def state_estimation(self, z: jax.Array, a: jax.Array, params: Dict
+                     ) -> jax.Array:
+    z = jnp.concatenate([z, a], axis=-1)
+    return self.state_estimator_model.apply_fn({'params': params}, z)
 
   @jax.jit
   def sample_actions(self,

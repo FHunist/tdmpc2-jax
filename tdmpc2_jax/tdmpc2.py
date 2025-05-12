@@ -36,6 +36,7 @@ class TDMPC2(struct.PyTreeNode):
   consistency_coef: float
   reward_coef: float
   value_coef: float
+  state_est_coef: float
   continue_coef: float
   entropy_coef: float
   tau: float
@@ -60,6 +61,7 @@ class TDMPC2(struct.PyTreeNode):
              consistency_coef: float,
              reward_coef: float,
              value_coef: float,
+             state_est_coef: float,
              continue_coef: float,
              entropy_coef: float,
              tau: float
@@ -81,6 +83,7 @@ class TDMPC2(struct.PyTreeNode):
                consistency_coef=consistency_coef,
                reward_coef=reward_coef,
                value_coef=value_coef,
+               state_est_coef=state_est_coef,
                continue_coef=continue_coef,
                entropy_coef=entropy_coef,
                tau=tau,
@@ -95,7 +98,6 @@ class TDMPC2(struct.PyTreeNode):
           key: PRNGKeyArray):
     plan_key, encoder_key = jax.random.split(key, 2)
     z = self.model.encode(obs, self.model.encoder.params, key=encoder_key)
-
     if self.mpc:
       num_envs = z.shape[0] if z.ndim > 1 else 1
       if prev_plan is None:
@@ -239,6 +241,7 @@ class TDMPC2(struct.PyTreeNode):
                             dynamics_params: Dict,
                             value_params: Dict,
                             reward_params: Dict,
+                            state_estimator_params: Dict,
                             continue_params: Dict):
       encoder_key, td_target_key, Q_key = jax.random.split(world_model_key, 3)
 
@@ -271,6 +274,17 @@ class TDMPC2(struct.PyTreeNode):
               self.model.symlog_min,
               self.model.symlog_max,
               self.model.num_bins).mean(axis=-1, where=~finished[:-1]))
+      
+      # -- NEW -- State estimation loss
+      state_estimation = self.model.state_estimation(zs[:-1], actions, state_estimator_params)
+      jax.debug.print("state_estimation shape  = {state_estimation}", state_estimation=state_estimation.shape)
+      jax.debug.print("observation state raw = {state_raw}", state_raw=observations["state_raw"][:, 0, :])
+      state_target = observations["state_raw"]
+      jax.debug.print("state_target shape  = {state_target}", state_target=state_target.shape)
+      jax.debug.print(" next observations shape  = {next_observations}", next_observations=next_observations["state_raw"].shape)
+      state_estimation_loss = jnp.mean((state_estimation - state_target)**2)
+      # -- END NEW --
+      
 
       # Value loss
       _, Q_logits = self.model.Q(zs[:-1], actions, value_params, key=Q_key)
@@ -299,12 +313,14 @@ class TDMPC2(struct.PyTreeNode):
           self.consistency_coef * consistency_loss +
           self.reward_coef * reward_loss +
           self.value_coef * value_loss +
+          self.state_est_coef * state_estimation_loss +
           self.continue_coef * continue_loss
       )
 
       return total_loss, {
           'consistency_loss': consistency_loss,
           'reward_loss': reward_loss,
+          'state_estimation_loss': state_estimation_loss,
           'value_loss': value_loss,
           'continue_loss': continue_loss,
           'total_loss': total_loss,
@@ -312,14 +328,19 @@ class TDMPC2(struct.PyTreeNode):
       }
 
     # Update world model
-    (encoder_grads, dynamics_grads, value_grads, reward_grads, continue_grads), model_info = jax.grad(
-        world_model_loss_fn, argnums=(0, 1, 2, 3, 4), has_aux=True)(
+    (encoder_grads, dynamics_grads, value_grads, reward_grads, state_estimate_grads, continue_grads), model_info = jax.grad(
+        world_model_loss_fn, argnums=(0, 1, 2, 3, 4, 5), has_aux=True)(
             self.model.encoder.params,
             self.model.dynamics_model.params,
             self.model.value_model.params,
             self.model.reward_model.params,
+            self.model.state_estimator_model.params,
             self.model.continue_model.params if self.model.predict_continues else None)
     zs = model_info.pop('zs')
+
+    # grads_flat, _ = jax.tree_flatten(encoder_grads)
+    # norms = [jnp.linalg.norm(g) for g in grads_flat]
+    # jax.debug.print("encoder grad norms = {norms}", norms=norms)
 
     new_encoder = self.model.encoder.apply_gradients(grads=encoder_grads)
     new_dynamics_model = self.model.dynamics_model.apply_gradients(
@@ -328,6 +349,8 @@ class TDMPC2(struct.PyTreeNode):
         grads=reward_grads)
     new_value_model = self.model.value_model.apply_gradients(
         grads=value_grads)
+    new_state_estimator_model = self.model.state_estimator_model.apply_gradients(
+        grads=state_estimate_grads)
     new_target_value_model = self.model.target_value_model.replace(
         params=optax.incremental_update(
             new_value_model.params,
@@ -367,6 +390,7 @@ class TDMPC2(struct.PyTreeNode):
         dynamics_model=new_dynamics_model,
         reward_model=new_reward_model,
         value_model=new_value_model,
+        state_estimator_model=new_state_estimator_model,
         policy_model=new_policy,
         target_value_model=new_target_value_model,
         continue_model=new_continue_model),
