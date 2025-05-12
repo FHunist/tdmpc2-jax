@@ -277,12 +277,11 @@ class TDMPC2(struct.PyTreeNode):
       
       # -- NEW -- State estimation loss
       state_estimation = self.model.state_estimation(zs[:-1], actions, state_estimator_params)
-      jax.debug.print("state_estimation shape  = {state_estimation}", state_estimation=state_estimation.shape)
-      jax.debug.print("observation state raw = {state_raw}", state_raw=observations["state_raw"][:, 0, :])
-      state_target = observations["state_raw"]
-      jax.debug.print("state_target shape  = {state_target}", state_target=state_target.shape)
-      jax.debug.print(" next observations shape  = {next_observations}", next_observations=next_observations["state_raw"].shape)
-      state_estimation_loss = jnp.mean((state_estimation - state_target)**2)
+      discount_factors = (self.rho**jnp.arange(self.horizon))[:, None]
+      state_estimation_loss = jnp.sum(
+        discount_factors * 
+        jnp.mean((state_estimation - observations["state_raw"])**2, 
+             axis=-1, where=(~finished[:-1])[..., None])) / self.horizon
       # -- END NEW --
       
 
