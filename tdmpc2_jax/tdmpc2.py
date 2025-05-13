@@ -277,13 +277,22 @@ class TDMPC2(struct.PyTreeNode):
       
       # -- NEW -- State estimation loss
       state_estimation = self.model.state_estimation(zs[:-1], actions, state_estimator_params)
-      discount_factors = (self.rho**jnp.arange(self.horizon))[:, None]
-      state_estimation_loss = jnp.sum(
-        discount_factors * 
-        jnp.mean((state_estimation - observations["state_raw"])**2, 
-             axis=-1, where=(~finished[:-1])[..., None])) / self.horizon
+      state_target = observations["state_raw"]
+      state_estimation_loss = 0.0
+      pos_err, quat_err, lin_vel_err, ang_vel_err = 0.0, 0.0, 0.0, 0.0
+      for t in range(self.horizon):
+        state_estimation_loss += self.rho**t * jnp.mean(
+            (state_estimation[t] - state_target[t])**2, 
+            where=~finished[t][:, None]  
+        )
+      # losses per state only for current time step
+      pos_err += jnp.mean((state_estimation[0][:, :3] - state_target[0][:, :3])**2)
+      quat_err += jnp.mean((state_estimation[0][:, 3:7] - state_target[0][:, 3:7])**2)
+      lin_vel_err += jnp.mean((state_estimation[0][:, 7:10] - state_target[0][:, 7:10])**2)
+      ang_vel_err += jnp.mean((state_estimation[0][:, 10:13] - state_target[0][:, 10:13])**2)
+      state_estimation_loss = state_estimation_loss / self.horizon 
       # -- END NEW --
-      
+        
 
       # Value loss
       _, Q_logits = self.model.Q(zs[:-1], actions, value_params, key=Q_key)
@@ -320,6 +329,10 @@ class TDMPC2(struct.PyTreeNode):
           'consistency_loss': consistency_loss,
           'reward_loss': reward_loss,
           'state_estimation_loss': state_estimation_loss,
+          'pos_err': pos_err,
+          'quat_err': quat_err,
+          'lin_vel_err': lin_vel_err,
+          'ang_vel_err': ang_vel_err,
           'value_loss': value_loss,
           'continue_loss': continue_loss,
           'total_loss': total_loss,
