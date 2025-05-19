@@ -277,9 +277,9 @@ class TDMPC2(struct.PyTreeNode):
       
       # -- NEW -- State estimation loss
       state_estimation = self.model.state_estimation(zs[:-1], actions, state_estimator_params)
-      state_target = observations["state_raw"]
+      state_target = observations["state"][..., :15]
       state_estimation_loss = 0.0
-      pos_err, quat_err, lin_vel_err, ang_vel_err = 0.0, 0.0, 0.0, 0.0
+      pos_err, rot_err, lin_vel_err, ang_vel_err = 0.0, 0.0, 0.0, 0.0
       for t in range(self.horizon):
         state_estimation_loss += self.rho**t * jnp.mean(
             (state_estimation[t] - state_target[t])**2, 
@@ -287,9 +287,9 @@ class TDMPC2(struct.PyTreeNode):
         )
       # losses per state only for current time step
       pos_err += jnp.mean((state_estimation[0][:, :3] - state_target[0][:, :3])**2)
-      quat_err += jnp.mean((state_estimation[0][:, 3:7] - state_target[0][:, 3:7])**2)
-      lin_vel_err += jnp.mean((state_estimation[0][:, 7:10] - state_target[0][:, 7:10])**2)
-      ang_vel_err += jnp.mean((state_estimation[0][:, 10:13] - state_target[0][:, 10:13])**2)
+      rot_err += jnp.mean((state_estimation[0][:, 3:9] - state_target[0][:, 3:9])**2)
+      lin_vel_err += jnp.mean((state_estimation[0][:, 9:12] - state_target[0][:, 9:12])**2)
+      ang_vel_err += jnp.mean((state_estimation[0][:, 12:15] - state_target[0][:, 12:15])**2)
       state_estimation_loss = state_estimation_loss / self.horizon 
       # -- END NEW --
         
@@ -330,7 +330,7 @@ class TDMPC2(struct.PyTreeNode):
           'reward_loss': reward_loss,
           'state_estimation_loss': state_estimation_loss,
           'pos_err': pos_err,
-          'quat_err': quat_err,
+          'rot_err': rot_err,
           'lin_vel_err': lin_vel_err,
           'ang_vel_err': ang_vel_err,
           'value_loss': value_loss,
