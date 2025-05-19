@@ -225,6 +225,7 @@ class TDMPC2(struct.PyTreeNode):
   def update(self,
              observations: jax.Array,
              actions: jax.Array,
+             expert_actions: jax.Array, # for teacher-student training
              rewards: jax.Array,
              next_observations: jax.Array,
              terminated: jax.Array,
@@ -354,9 +355,16 @@ class TDMPC2(struct.PyTreeNode):
 
       # Compute policy objective (equation 4)
       rho = self.rho ** jnp.arange(self.horizon+1)
-      policy_loss = ((self.entropy_coef * log_probs -
+      # Add behavioral cloning loss
+      bc_coef = 0.1 # hardcode for now - otherwise expert checkpoint doesn't load
+      act_diff = jnp.mean((actions[:self.horizon] - sg(expert_actions))**2, axis=-1)
+      bc_loss = ((self.rho**np.arange(self.horizon)).reshape(-1, 1) * act_diff).mean()
+
+      rl_loss = ((self.entropy_coef * log_probs -
                      Q).mean(axis=1) * rho).mean()
-      return policy_loss, {'policy_loss': policy_loss, 'policy_scale': scale}
+      policy_loss = rl_loss + bc_coef * bc_loss
+
+      return policy_loss, {'policy_loss': policy_loss, 'policy_scale': scale, 'bc_loss': bc_loss}
     policy_grads, policy_info = jax.grad(policy_loss_fn, has_aux=True)(
         self.model.policy_model.params)
     new_policy = self.model.policy_model.apply_gradients(grads=policy_grads)
