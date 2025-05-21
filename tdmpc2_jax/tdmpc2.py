@@ -276,7 +276,10 @@ class TDMPC2(struct.PyTreeNode):
               self.model.num_bins).mean(axis=-1, where=~finished[:-1]))
       
       # -- NEW -- State estimation loss
-      state_estimation = self.model.state_estimation(zs[:-1], actions, state_estimator_params)
+      encodings = jnp.zeros((self.horizon+1, self.batch_size, next_z.shape[-1]))
+      encodings = encodings.at[0].set(first_z)
+      encodings = encodings.at[1:].set(next_z)
+      state_estimation = self.model.state_estimation(encodings[:-1], actions, state_estimator_params)
       state_target = observations["state"][..., :15]
       state_estimation_loss = 0.0
       pos_err, rot_err, lin_vel_err, ang_vel_err = 0.0, 0.0, 0.0, 0.0
