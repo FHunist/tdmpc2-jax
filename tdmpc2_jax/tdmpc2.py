@@ -123,6 +123,7 @@ class TDMPC2(struct.PyTreeNode):
            prev_plan: Tuple[jax.Array, jax.Array],
            train: bool,
            key: PRNGKeyArray,
+           rnn_carry: jax.Array,
            ) -> Tuple[jax.Array, jax.Array]:
     """
     Select next action via MPPI planner
@@ -151,13 +152,14 @@ class TDMPC2(struct.PyTreeNode):
     policy_actions = jnp.zeros(
         (self.horizon, self.policy_prior_samples, self.model.action_dim))
     z_t = z.repeat(self.policy_prior_samples, axis=0)
+    carries_t = rnn_carry.repeat(self.policy_prior_samples, axis=0)
     for t in range(self.horizon-1):
       policy_actions = policy_actions.at[t].set(
           self.model.sample_actions(
               z_t, self.model.policy_model.params, key=prior_noise_keys[t])[0]
       )
-      z_t = self.model.next(
-          z_t, policy_actions[t], self.model.dynamics_model.params
+      z_t, carries_t = self.model.next(
+          z_t, policy_actions[t], self.model.dynamics_model.params, carries_t
       )
     policy_actions = policy_actions.at[-1].set(
         self.model.sample_actions(
@@ -181,6 +183,7 @@ class TDMPC2(struct.PyTreeNode):
         ))
     # Initialize population state
     z_t = z.repeat(self.population_size, axis=0)
+    carries_t = rnn_carry.repeat(self.population_size, axis=0)
     mean = jnp.zeros((self.horizon, self.model.action_dim))
     std = jnp.full((self.horizon, self.model.action_dim), self.max_plan_std)
     # Warm start with previous plan
@@ -195,9 +198,10 @@ class TDMPC2(struct.PyTreeNode):
       actions = actions.clip(-1, 1)
 
       # Compute elites
-      value = self.estimate_value(z_t, actions, key=value_keys[i])
+      value, trajectory_carries = self.estimate_value(z_t, actions, carries_t, key=value_keys[i])
       _, elite_inds = jax.lax.top_k(value, self.num_elites)
       elite_values, elite_actions = value[elite_inds], actions[:, elite_inds]
+      elite_carries = trajectory_carries[elite_inds]
 
       # Update population distribution
       score = jnp.exp(self.temperature * (elite_values - elite_values.max()))
@@ -218,8 +222,9 @@ class TDMPC2(struct.PyTreeNode):
     action += jnp.array(train, float) * \
         action_std * jax.random.normal(action_noise_key, shape=action.shape)
     action = action.clip(-1, 1)
+    final_carry = trajectory_carries[action_ind]
 
-    return action, (mean, std)
+    return action, (mean, std), final_carry
 
   @jax.jit
   def update(self,
@@ -249,6 +254,10 @@ class TDMPC2(struct.PyTreeNode):
           key=first_encoder_key)
       next_z = sg(self.model.encode(next_observations,
                   encoder_params, key=next_encoder_key))
+      
+      # preparation RNN inputs
+      batch_size = next_z.shape[0]
+      initial_carry = jnp.zeros((batch_size, self.model.dynamics_model.hidden_dim))
 
       # Latent rollout (compute latent dynamics + consistency loss)
       done = jnp.logical_or(terminated, truncated)
@@ -256,9 +265,16 @@ class TDMPC2(struct.PyTreeNode):
       consistency_loss = 0
       zs = jnp.zeros((self.horizon+1, self.batch_size, next_z.shape[-1]))
       zs = zs.at[0].set(first_z)
+      current_carry = initial_carry
+      carries = jnp.zeros((self.horizon+1, batch_size, self.model.dynamics_model.hidden_dim))
+      carries = carries.at[0].set(current_carry)
+
       for t in range(self.horizon):
-        z = self.model.next(zs[t], actions[t], dynamics_params)
+        z, current_carry = self.model.next(zs[t], actions[t], dynamics_params, current_carry)
         zs = zs.at[t+1].set(z)
+        carries = carries.at[t+1].set(current_carry)
+        reset_mask = finished[t][:, None] 
+        current_carry = jnp.where(reset_mask, initial_carry, current_carry)
         consistency_loss += self.rho**t * \
             jnp.mean((z - next_z[t])**2, where=~finished[t][:, None])
         finished = finished.at[t+1].set(jnp.logical_or(finished[t], done[t]))
@@ -308,7 +324,8 @@ class TDMPC2(struct.PyTreeNode):
           'value_loss': value_loss,
           'continue_loss': continue_loss,
           'total_loss': total_loss,
-          'zs': zs
+          'zs': zs,
+          'carries': carries,
       }
 
     # Update world model
@@ -376,12 +393,18 @@ class TDMPC2(struct.PyTreeNode):
     return new_agent, info
 
   @jax.jit
-  def estimate_value(self, z: jax.Array, actions: jax.Array, key: PRNGKeyArray) -> jax.Array:
+  def estimate_value(self, z: jax.Array, actions: jax.Array, carry: Optional[jax.Array], key: PRNGKeyArray) -> jax.Array:
+    batch_size = z.shape[0]
+    if carry is None:
+      carry = jnp.zeros((batch_size, self.model.dynamics_model.hidden_dim))
     G, discount = 0.0, 1.0
+    trajectory_carries = [carry]
     for t in range(self.horizon):
       reward, _ = self.model.reward(
           z, actions[t], self.model.reward_model.params)
-      z = self.model.next(z, actions[t], self.model.dynamics_model.params)
+      z, carry = self.model.next(z, actions[t], self.model.dynamics_model.params, carry)
+      trajectory_carries.append(carry)
+
       G += discount * reward.astype(jnp.float32)
 
       if self.model.predict_continues:
@@ -399,7 +422,8 @@ class TDMPC2(struct.PyTreeNode):
     Qs, _ = self.model.Q(
         z, next_action, self.model.value_model.params, key=Q_key)
     Q = Qs.mean(axis=0)
-    return sg(G + discount * Q)
+    all_carries = jnp.stack(trajectory_carries, axis=0)
+    return sg(G + discount * Q), all_carries[-1]
 
   @jax.jit
   def td_target(self, next_z: jax.Array, reward: jax.Array, terminal: jax.Array,

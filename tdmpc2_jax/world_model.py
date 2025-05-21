@@ -12,7 +12,7 @@ from jaxtyping import PRNGKeyArray
 import jax
 import jax.numpy as jnp
 import optax
-from tdmpc2_jax.networks import Ensemble
+from tdmpc2_jax.networks import Ensemble, GRUDynamics 
 from tdmpc2_jax.common.util import symlog, two_hot_inv
 
 
@@ -67,12 +67,20 @@ class WorldModel(struct.PyTreeNode):
         key, 5)
 
     # Latent forward dynamics model
-    dynamics_module = nn.Sequential([
-        NormedLinear(mlp_dim, activation=mish, dtype=dtype),
-        NormedLinear(mlp_dim, activation=mish, dtype=dtype),
-        NormedLinear(latent_dim, activation=partial(
-            simnorm, simplex_dim=simnorm_dim), dtype=dtype)
-    ])
+    # dynamics_module = nn.Sequential([
+    #     NormedLinear(mlp_dim, activation=mish, dtype=dtype),
+    #     NormedLinear(mlp_dim, activation=mish, dtype=dtype),
+    #     NormedLinear(latent_dim, activation=partial(
+    #         simnorm, simplex_dim=simnorm_dim), dtype=dtype)
+    # ])
+    # ---- replacing dynamics MLP with RNN ----
+    dynamics_module = GRUDynamics(
+      latent_dim=latent_dim,
+      hidden_dim=mlp_dim,
+      action_dim=action_dim,
+      simnorm_dim=simnorm_dim,
+    )
+
     dynamics_model = TrainState.create(
         apply_fn=dynamics_module.apply,
         params=dynamics_module.init(
@@ -204,7 +212,8 @@ class WorldModel(struct.PyTreeNode):
         symlog_min=float(symlog_min),
         symlog_max=float(symlog_max),
         predict_continues=predict_continues,
-        symlog_obs=symlog_obs
+        symlog_obs=symlog_obs,
+        dynamics_carry=None,
     )
 
   @jax.jit
@@ -214,9 +223,20 @@ class WorldModel(struct.PyTreeNode):
     return self.encoder.apply_fn({'params': params}, obs, rngs={'dropout': key})
 
   @jax.jit
-  def next(self, z: jax.Array, a: jax.Array, params: Dict) -> jax.Array:
-    z = jnp.concatenate([z, a], axis=-1)
-    return self.dynamics_model.apply_fn({'params': params}, z)
+  def next(self, z: jax.Array, a: jax.Array, params: Dict, carry=None) -> jax.Array:
+    if carry is None:
+        carry = self.dynamics_carry if self.dynamics_carry is not None else jnp.zeros((z.shape[0], self.dynamics_model.hidden_dim))
+    next_z, new_carry = self.dynamics_model.apply_fn(
+        {'params': params}, z, a, carry=carry)
+    return next_z, new_carry
+  
+  @jax.jit
+  def update_carry(self, new_carry: jax.Array) -> 'WorldModel':
+    return self.replace(dynamics_carry=new_carry)
+  
+  @jax.hit
+  def reset_carry(self, batch_size: int=1) -> 'WorldModel':
+    return self.replace(dynamics_carry=jnp.zeros(batch_size, self.dynamics_model.hidden_dim))
 
   @jax.jit
   def reward(self, z: jax.Array, a: jax.Array, params: Dict
