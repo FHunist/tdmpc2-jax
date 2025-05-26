@@ -36,6 +36,7 @@ class WorldModel(struct.PyTreeNode):
   symlog_max: float
   predict_continues: bool = struct.field(pytree_node=False)
   symlog_obs: bool = struct.field(pytree_node=False)
+  carry: jax.Array = struct.field(pytree_node=False)
 
   @classmethod
   def create(cls,
@@ -84,7 +85,7 @@ class WorldModel(struct.PyTreeNode):
     dynamics_model = TrainState.create(
         apply_fn=dynamics_module.apply,
         params=dynamics_module.init(
-            dynamics_key, jnp.zeros(latent_dim + action_dim))['params'],
+            dynamics_key, jnp.zeros((1,latent_dim)), jnp.zeros((1,action_dim)), jnp.zeros((1, mlp_dim)))['params'],
         tx=optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(max_grad_norm),
@@ -213,7 +214,7 @@ class WorldModel(struct.PyTreeNode):
         symlog_max=float(symlog_max),
         predict_continues=predict_continues,
         symlog_obs=symlog_obs,
-        dynamics_carry=None,
+        carry=jnp.zeros((32, mlp_dim))
     )
 
   @jax.jit
@@ -225,18 +226,18 @@ class WorldModel(struct.PyTreeNode):
   @jax.jit
   def next(self, z: jax.Array, a: jax.Array, params: Dict, carry=None) -> jax.Array:
     if carry is None:
-        carry = self.dynamics_carry if self.dynamics_carry is not None else jnp.zeros((z.shape[0], self.dynamics_model.hidden_dim))
+        carry = self.carry if self.carry is not None else jnp.zeros((z.shape[0], self.dynamics_model.hidden_dim))
     next_z, new_carry = self.dynamics_model.apply_fn(
         {'params': params}, z, a, carry=carry)
     return next_z, new_carry
   
   @jax.jit
   def update_carry(self, new_carry: jax.Array) -> 'WorldModel':
-    return self.replace(dynamics_carry=new_carry)
+    return self.replace(carry=new_carry)
   
-  @jax.hit
+  @partial(jax.jit, static_argnums=(1,))
   def reset_carry(self, batch_size: int=1) -> 'WorldModel':
-    return self.replace(dynamics_carry=jnp.zeros(batch_size, self.dynamics_model.hidden_dim))
+    return self.replace(carry=jnp.zeros((batch_size, self.mlp_dim)))
 
   @jax.jit
   def reward(self, z: jax.Array, a: jax.Array, params: Dict

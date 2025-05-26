@@ -7,62 +7,47 @@ from tdmpc2_jax.common.activations import mish, simnorm
 
 class GRUDynamics(nn.Module):
     """GRU-based dynamics model for TD-MPC2"""
-    latent_dim: int        # Output latent dimension
-    hidden_dim: int        # GRU hidden dimension
-    action_dim: int        # Action dimension
-    simnorm_dim: int = 8   # SimNorm dimension for compatibility
-    activation: callable = mish  # Activation function
+    latent_dim: int
+    hidden_dim: int
+    action_dim: int
+    simnorm_dim: int = 8
+    activation: callable = mish
     
     def setup(self):
-        # Input projection layer (latent + action to GRU input)
-        self.input_projector = nn.Sequential([
-            nn.Dense(self.hidden_dim),
-            self.activation,
-            nn.LayerNorm()
-        ])
+        # Input projection layers
+        self.input_dense = nn.Dense(self.hidden_dim)
+        self.input_norm = nn.LayerNorm()
         
         # GRU cell
         self.gru_cell = nn.GRUCell(features=self.hidden_dim)
         
-        # Output projection (GRU hidden to latent with SimNorm for compatibility)
-        self.output_projector = nn.Sequential([
-            nn.Dense(self.hidden_dim),
-            self.activation,
-            nn.LayerNorm(),
-            nn.Dense(self.latent_dim),
-            partial(simnorm, simplex_dim=self.simnorm_dim)
-        ])
+        # Output projection layers
+        self.output_dense1 = nn.Dense(self.hidden_dim)
+        self.output_norm = nn.LayerNorm()
+        self.output_dense2 = nn.Dense(self.latent_dim)
     
-    def __call__(self, z: jnp.ndarray, a: jnp.ndarray, 
-                 carry: Optional[jnp.ndarray] = None) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """
-        Forward pass of GRU dynamics
-        
-        Args:
-            z: Current latent state [batch_size, latent_dim]
-            a: Action [batch_size, action_dim]
-            carry: Previous GRU hidden state [batch_size, hidden_dim]
-            
-        Returns:
-            next_z: Predicted next latent state [batch_size, latent_dim]
-            new_carry: Updated GRU hidden state [batch_size, hidden_dim]
-        """
+    def __call__(self, z, a, carry=None):
         batch_size = z.shape[0]
         
-        # Initialize carry (hidden state) if not provided
         if carry is None:
             carry = jnp.zeros((batch_size, self.hidden_dim))
         
-        # Concatenate latent and action
+        # Input processing
         inputs = jnp.concatenate([z, a], axis=-1)
+        inputs = self.input_dense(inputs)
+        inputs = self.activation(inputs)
         
-        # Process through input projector
-        inputs = self.input_projector(inputs)
+        # GRU forward pass - returns (new_carry, gru_output)
+        new_carry, gru_output = self.gru_cell(carry, inputs)
         
-        # Update GRU state
-        new_carry = self.gru_cell(carry, inputs)
+        # Option 1: Use gru_output (typically same as new_carry for GRU)
+        # Option 2: Use new_carry (hidden state)
+        # For GRU, they're usually the same, so either works
         
-        # Project to latent space
-        next_z = self.output_projector(new_carry)
+        # Project to latent space with SimNorm
+        output = self.output_dense1(gru_output)  # or new_carry
+        output = self.activation(output)
+        output = self.output_dense2(output)
+        next_z = simnorm(output, simplex_dim=self.simnorm_dim)
         
         return next_z, new_carry
