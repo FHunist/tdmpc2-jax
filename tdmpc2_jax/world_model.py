@@ -36,7 +36,6 @@ class WorldModel(struct.PyTreeNode):
   symlog_max: float
   predict_continues: bool = struct.field(pytree_node=False)
   symlog_obs: bool = struct.field(pytree_node=False)
-  carry: jax.Array = struct.field(pytree_node=False)
 
   @classmethod
   def create(cls,
@@ -214,7 +213,6 @@ class WorldModel(struct.PyTreeNode):
         symlog_max=float(symlog_max),
         predict_continues=predict_continues,
         symlog_obs=symlog_obs,
-        carry=jnp.zeros((32, mlp_dim))
     )
 
   @jax.jit
@@ -224,20 +222,15 @@ class WorldModel(struct.PyTreeNode):
     return self.encoder.apply_fn({'params': params}, obs, rngs={'dropout': key})
 
   @jax.jit
-  def next(self, z: jax.Array, a: jax.Array, params: Dict, carry=None) -> jax.Array:
+  def next(self, z: jax.Array, a: jax.Array, params: Dict, carry: jax.Array) -> jax.Array:
     if carry is None:
-        carry = self.carry if self.carry is not None else jnp.zeros((z.shape[0], self.dynamics_model.hidden_dim))
+        carry = jnp.zeros((z.shape[0], self.dynamics_model.hidden_dim))
     next_z, new_carry = self.dynamics_model.apply_fn(
         {'params': params}, z, a, carry=carry)
     return next_z, new_carry
   
-  @jax.jit
-  def update_carry(self, new_carry: jax.Array) -> 'WorldModel':
-    return self.replace(carry=new_carry)
+
   
-  @partial(jax.jit, static_argnums=(1,))
-  def reset_carry(self, batch_size: int=1) -> 'WorldModel':
-    return self.replace(carry=jnp.zeros((batch_size, self.mlp_dim)))
 
   @jax.jit
   def reward(self, z: jax.Array, a: jax.Array, params: Dict

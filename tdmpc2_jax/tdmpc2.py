@@ -89,6 +89,7 @@ class TDMPC2(struct.PyTreeNode):
 
   def act(self,
           obs: np.ndarray,
+          carry: jax.Array,
           prev_plan: Optional[Tuple[jax.Array]] = None,
           train: bool = True,
           *,
@@ -98,8 +99,8 @@ class TDMPC2(struct.PyTreeNode):
 
     # figure out if we need to reset carry to different dimension - on switch to evaluation
     num_envs = z.shape[0] if z.ndim > 1 else 1
-    if self.model.carry is None or self.model.carry.shape[0] != num_envs:
-        self.model = self.model.reset_carry(num_envs)
+    if carry is None:
+        carry = jnp.zeros((num_envs, self.model.dynamics_model.hidden_dim))
 
     if self.mpc:
       num_envs = z.shape[0] if z.ndim > 1 else 1
@@ -112,20 +113,20 @@ class TDMPC2(struct.PyTreeNode):
       action, plan = self.plan(
           z, prev_plan, train,
           jax.random.split(plan_key, num_envs),
-          self.model.carry)
+          carry)
       action = action.squeeze(0) if z.ndim == 1 else action
          # compute final carry based on the selected action
-      final_carry = self.model.next(
-            z, action, self.model.dynamics_model.params, self.model.carry)[1]
-      self.model.update_carry(final_carry) 
+      updated_carry = self.model.next(
+            z, action, self.model.dynamics_model.params, carry)[1]
 
     else:
       action = self.model.sample_actions(
           z, self.model.policy_model.params, key=plan_key)[0]
       plan = None
+      updated_carry = carry
 
 
-    return np.array(action), plan
+    return np.array(action), updated_carry, plan
 
   @jax.jit
   @partial(jax.vmap, in_axes=(None, 0, 0, None, 0, 0), out_axes=0)
