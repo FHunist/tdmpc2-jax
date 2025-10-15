@@ -337,7 +337,7 @@ class TDMPC2(struct.PyTreeNode):
           'continue_loss': continue_loss,
           'total_loss': total_loss,
           'zs': zs,
-          'carries': carries_rollout,
+          #'carries': carries_rollout,
       }
 
     # Update world model
