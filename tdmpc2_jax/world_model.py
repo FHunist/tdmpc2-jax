@@ -30,6 +30,7 @@ class WorldModel(struct.PyTreeNode):
   # Architecture
   mlp_dim: int = struct.field(pytree_node=False)
   latent_dim: int = struct.field(pytree_node=False)
+  hidden_dim: int = struct.field(pytree_node=False)
   num_value_nets: int = struct.field(pytree_node=False)
   num_bins: int = struct.field(pytree_node=False)
   symlog_min: float
@@ -46,6 +47,7 @@ class WorldModel(struct.PyTreeNode):
              # Architecture
              mlp_dim: int,
              latent_dim: int,
+             hidden_dim: int,
              value_dropout: float,
              num_value_nets: int,
              num_bins: int,
@@ -76,7 +78,7 @@ class WorldModel(struct.PyTreeNode):
     # ---- replacing dynamics MLP with RNN ----
     dynamics_module = GRUDynamics(
       latent_dim=latent_dim,
-      hidden_dim=mlp_dim,
+      hidden_dim=hidden_dim,
       action_dim=action_dim,
       simnorm_dim=simnorm_dim,
     )
@@ -84,7 +86,7 @@ class WorldModel(struct.PyTreeNode):
     dynamics_model = TrainState.create(
         apply_fn=dynamics_module.apply,
         params=dynamics_module.init(
-            dynamics_key, jnp.zeros((1,latent_dim)), jnp.zeros((1,action_dim)), jnp.zeros((1, mlp_dim)))['params'],
+            dynamics_key, jnp.zeros((1,latent_dim)), jnp.zeros((1,action_dim)), jnp.zeros((1, hidden_dim)))['params'],
         tx=optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(max_grad_norm),
@@ -100,7 +102,7 @@ class WorldModel(struct.PyTreeNode):
     reward_model = TrainState.create(
         apply_fn=reward_module.apply,
         params=reward_module.init(
-            reward_key, jnp.zeros(latent_dim + action_dim))['params'],
+            reward_key, jnp.zeros(latent_dim + action_dim + hidden_dim))['params'],
         tx=optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(max_grad_norm),
@@ -116,7 +118,7 @@ class WorldModel(struct.PyTreeNode):
     ])
     policy_model = TrainState.create(
         apply_fn=policy_module.apply,
-        params=policy_module.init(policy_key, jnp.zeros(latent_dim))['params'],
+        params=policy_module.init(policy_key, jnp.zeros(latent_dim + hidden_dim))['params'],
         tx=optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(max_grad_norm),
@@ -135,7 +137,7 @@ class WorldModel(struct.PyTreeNode):
         apply_fn=value_ensemble.apply,
         params=value_ensemble.init(
             {'params': value_param_key, 'dropout': value_dropout_key},
-            jnp.zeros(latent_dim + action_dim))['params'],
+            jnp.zeros(latent_dim + action_dim + hidden_dim))['params'],
         tx=optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(max_grad_norm),
@@ -168,24 +170,25 @@ class WorldModel(struct.PyTreeNode):
       print("Dynamics Model")
       print("--------------")
       print(dynamics_module.tabulate(jax.random.key(0), jnp.ones(
-          latent_dim + action_dim), compute_flops=True))
+          latent_dim + action_dim), jnp.ones(hidden_dim), compute_flops=True))
+
 
       print("Reward Model")
       print("------------")
       print(reward_module.tabulate(jax.random.key(0), jnp.ones(
-          latent_dim + action_dim), compute_flops=True))
+          latent_dim + action_dim + hidden_dim), compute_flops=True))
 
       print("Policy Model")
       print("------------")
       print(policy_module.tabulate(jax.random.key(0), jnp.ones(
-          latent_dim), compute_flops=True))
+          latent_dim + hidden_dim), compute_flops=True))
 
       print("Value Model")
       print("-----------")
       value_param_key, value_dropout_key = jax.random.split(value_key)
       print(value_ensemble.tabulate(
           {'params': value_param_key, 'dropout': value_dropout_key},
-          jnp.ones(latent_dim + action_dim), compute_flops=True))
+          jnp.ones(latent_dim + action_dim + hidden_dim), compute_flops=True))
 
       if predict_continues:
         print("Continue Model")
@@ -207,6 +210,7 @@ class WorldModel(struct.PyTreeNode):
         # Architecture
         mlp_dim=mlp_dim,
         latent_dim=latent_dim,
+        hidden_dim=hidden_dim,
         num_value_nets=num_value_nets,
         num_bins=num_bins,
         symlog_min=float(symlog_min),
@@ -224,7 +228,7 @@ class WorldModel(struct.PyTreeNode):
   @jax.jit
   def next(self, z: jax.Array, a: jax.Array, params: Dict, carry: jax.Array) -> jax.Array:
     if carry is None:
-        carry = jnp.zeros((z.shape[0], self.dynamics_model.hidden_dim))
+        carry = jnp.zeros((z.shape[0], self.hidden_dim))
     next_z, new_carry = self.dynamics_model.apply_fn(
         {'params': params}, z, a, carry=carry)
     return next_z, new_carry
@@ -233,9 +237,9 @@ class WorldModel(struct.PyTreeNode):
   
 
   @jax.jit
-  def reward(self, z: jax.Array, a: jax.Array, params: Dict
+  def reward(self, z: jax.Array, a: jax.Array, carry: jax.Array, params: Dict
              ) -> Tuple[jax.Array, jax.Array]:
-    z = jnp.concatenate([z, a], axis=-1)
+    z = jnp.concatenate([z, a, carry], axis=-1)
     logits = self.reward_model.apply_fn({'params': params}, z)
     reward = two_hot_inv(logits, self.symlog_min,
                          self.symlog_max, self.num_bins)
@@ -244,12 +248,15 @@ class WorldModel(struct.PyTreeNode):
   @jax.jit
   def sample_actions(self,
                      z: jax.Array,
+                     carry: jax.Array,
                      params: Dict,
                      min_log_std: float = -10,
                      max_log_std: float = 2,
                      *,
                      key: PRNGKeyArray
                      ) -> Tuple[jax.Array, ...]:
+    # Concatenate carry to latent state
+    z = jnp.concatenate([z, carry], axis=-1)
     # Chunk the policy model output to get mean and logstd
     mu, log_std = jnp.split(self.policy_model.apply_fn(
         {'params': params}, z), 2, axis=-1)
@@ -270,9 +277,9 @@ class WorldModel(struct.PyTreeNode):
     return action, mean, log_std, log_probs
 
   @jax.jit
-  def Q(self, z: jax.Array, a: jax.Array, params: Dict, key: PRNGKeyArray
+  def Q(self, z: jax.Array, a: jax.Array, carry: jax.Array, params: Dict, key: PRNGKeyArray
         ) -> Tuple[jax.Array, jax.Array]:
-    z = jnp.concatenate([z, a], axis=-1)
+    z = jnp.concatenate([z, a, carry], axis=-1)
     logits = self.value_model.apply_fn(
         {'params': params}, z, rngs={'dropout': key})
 
