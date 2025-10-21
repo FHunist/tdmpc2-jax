@@ -1,7 +1,7 @@
 import os
 from collections import defaultdict
 from functools import partial
-
+import copy
 import flax.linen as nn
 import gymnasium as gym
 import hydra
@@ -97,6 +97,7 @@ def train(cfg: dict):
   dummy_action = env.action_space.sample()
   dummy_next_obs, dummy_reward, dummy_term, dummy_trunc, _ = \
       env.step(dummy_action)
+  dummy_hidden_state = jnp.zeros((env_config.num_envs, model_config.hidden_dim))
   replay_buffer = SequentialReplayBuffer(
       capacity=cfg.max_steps//env_config.num_envs,
       num_envs=env_config.num_envs,
@@ -106,6 +107,7 @@ def train(cfg: dict):
           action=dummy_action,
           reward=dummy_reward,
           next_observation=dummy_next_obs,
+          hidden_state = dummy_hidden_state,
           terminated=dummy_term,
           truncated=dummy_trunc)
   )
@@ -175,7 +177,7 @@ def train(cfg: dict):
                   agent.model.action_dim), agent.max_plan_std)
     )
     observation, _ = env.reset(seed=cfg.seed)
-
+    HIDDEN_STATE = jnp.zeros((env_config.num_envs, model_config.hidden_dim), dtype=dtype)
     T = 500
     seed_steps = int(max(5*T, 1000) * env_config.num_envs *
                      env_config.utd_ratio)
@@ -185,10 +187,11 @@ def train(cfg: dict):
         action = env.action_space.sample()
       else:
         rng, action_key = jax.random.split(rng)
+        PREV_HIDDEN_STATE = copy.deepcopy(HIDDEN_STATE)
         prev_plan = (prev_plan[0],
                      jnp.full_like(prev_plan[1], agent.max_plan_std))
-        action, prev_plan = agent.act(
-            observation, prev_plan=prev_plan, train=True, key=action_key)
+        action, HIDDEN_STATE, prev_plan = agent.act(
+            observation, HIDDEN_STATE, prev_plan=prev_plan, train=True, key=action_key)
 
       next_observation, reward, terminated, truncated, info = env.step(action)
 
@@ -202,9 +205,10 @@ def train(cfg: dict):
           action=action,
           reward=reward,
           next_observation=real_next_observation,
+          hidden_state=PREV_HIDDEN_STATE,
           terminated=terminated,
           truncated=truncated))
-      observation = next_observation
+      observation = copy.deepcopy(next_observation)
 
       # Handle terminations/truncations
       done = np.logical_or(terminated, truncated)
@@ -246,6 +250,7 @@ def train(cfg: dict):
               actions=batch['action'],
               rewards=batch['reward'],
               next_observations=batch['next_observation'],
+              hidden_states=batch['hidden_state'],
               terminated=batch['terminated'],
               truncated=batch['truncated'],
               key=update_keys[iupdate])
